@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from collections import deque
+from pathlib import Path
+from datetime import datetime
+import os
+import shutil
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 HOST = "0.0.0.0"
 PORT = 8000
@@ -16,6 +20,8 @@ QUALITY = 80
 DEFAULT_AWB = "auto"
 DEFAULT_SATURATION = 1.0
 DEFAULT_CONTRAST = 1.0
+SNAPSHOT_DIR = Path("captures")
+RECORDING_DIR = Path("recordings")
 
 RESOLUTION_PRESETS = {
     "640x480": (640, 480),
@@ -41,6 +47,12 @@ camera_settings = {
     "saturation": DEFAULT_SATURATION,
     "contrast": DEFAULT_CONTRAST,
 }
+recording_lock = threading.Lock()
+recording_proc = None
+recording_path = None
+recording_started_at = None
+ffmpeg_lock = threading.Lock()
+ffmpeg_install_error = ""
 
 
 def drain_stderr(pipe, tail):
@@ -104,6 +116,161 @@ def render_option_buttons(name, options, current_value, formatter=str):
             f'<a class="{class_name}" href="/control?{name}={option}">{label}</a>'
         )
     return "".join(buttons)
+
+
+def ffmpeg_available():
+    return shutil.which("ffmpeg") is not None
+
+
+def install_ffmpeg():
+    global ffmpeg_install_error
+
+    with ffmpeg_lock:
+        if ffmpeg_available():
+            ffmpeg_install_error = ""
+            return True, "ffmpeg is already installed."
+
+        prefix = ["sudo"] if os.geteuid() != 0 else []
+        commands = [
+            prefix + ["apt-get", "update"],
+            prefix + ["apt-get", "install", "-y", "ffmpeg"],
+        ]
+
+        try:
+            for cmd in commands:
+                result = subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.stderr.strip():
+                    ffmpeg_install_error = result.stderr.strip()
+            ffmpeg_install_error = ""
+            return True, "ffmpeg installed successfully."
+        except FileNotFoundError as exc:
+            ffmpeg_install_error = "apt-get or sudo is not available on this system."
+            return False, ffmpeg_install_error
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg installation failed."
+            ffmpeg_install_error = detail
+            return False, detail
+
+
+def ensure_output_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def capture_snapshot():
+    with frame_cond:
+        ok = frame_cond.wait_for(lambda: latest_frame is not None, timeout=10)
+        frame = latest_frame if ok else None
+
+    if frame is None:
+        raise RuntimeError("No frame available yet")
+
+    ensure_output_dir(SNAPSHOT_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    snapshot_path = SNAPSHOT_DIR / f"snapshot-{timestamp}.jpg"
+    snapshot_path.write_bytes(frame)
+    return snapshot_path
+
+
+def get_recording_state():
+    global recording_proc, recording_path, recording_started_at
+
+    with recording_lock:
+        if recording_proc is not None and recording_proc.poll() is not None:
+            recording_proc = None
+            recording_path = None
+            recording_started_at = None
+
+        return {
+            "is_recording": recording_proc is not None,
+            "path": recording_path,
+            "started_at": recording_started_at,
+        }
+
+
+def start_recording():
+    global recording_proc, recording_path, recording_started_at
+
+    with recording_lock:
+        if recording_proc is not None and recording_proc.poll() is None:
+            return recording_path
+
+        if not ffmpeg_available():
+            raise RuntimeError("ffmpeg is not installed. Use the install button first.")
+
+        ensure_output_dir(RECORDING_DIR)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = RECORDING_DIR / f"recording-{timestamp}.mp4"
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "mpjpeg",
+            "-i",
+            f"http://127.0.0.1:{PORT}/stream.mjpg",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(target),
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is not installed. Use the install button first.") from exc
+
+        time.sleep(0.2)
+        if proc.poll() is not None:
+            err = proc.stderr.read().strip()
+            raise RuntimeError(err or "recording failed to start")
+
+        recording_proc = proc
+        recording_path = target
+        recording_started_at = datetime.now()
+        return target
+
+
+def stop_recording():
+    global recording_proc, recording_path, recording_started_at
+
+    with recording_lock:
+        proc = recording_proc
+        target = recording_path
+
+        if proc is None or proc.poll() is not None:
+            recording_proc = None
+            recording_path = None
+            recording_started_at = None
+            return target
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+        err = proc.stderr.read().strip() if proc.stderr is not None else ""
+        recording_proc = None
+        recording_path = None
+        recording_started_at = None
+
+        if proc.returncode not in (0, 255):
+            raise RuntimeError(err or "recording failed to stop cleanly")
+
+        return target
 
 
 def camera_worker():
@@ -239,8 +406,50 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if path == "/record":
+            params = parse_qs(parsed.query)
+            action = params.get("action", ["toggle"])[0]
+            try:
+                state = get_recording_state()
+                if action == "start" or (action == "toggle" and not state["is_recording"]):
+                    start_recording()
+                else:
+                    stop_recording()
+            except RuntimeError as exc:
+                self.send_response(303)
+                self.send_header("Location", f"/?message={quote_plus(str(exc))}")
+                self.end_headers()
+                return
+
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
+        if path == "/install-ffmpeg":
+            ok, message = install_ffmpeg()
+            self.send_response(303)
+            self.send_header("Location", f"/?message={quote_plus(message)}")
+            self.end_headers()
+            return
+
+        if path == "/save-snapshot":
+            try:
+                capture_snapshot()
+            except RuntimeError as exc:
+                self.send_error(503, str(exc))
+                return
+
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
         if path in ("/", "/index.html"):
             settings, _ = get_camera_settings()
+            recording_state = get_recording_state()
+            flash_message = parse_qs(parsed.query).get("message", [""])[0]
+            ffmpeg_ready = ffmpeg_available()
             resolution_label = f'{settings["width"]}x{settings["height"]}'
             resolution_buttons = render_option_buttons(
                 "resolution",
@@ -271,6 +480,19 @@ class Handler(BaseHTTPRequestHandler):
                 settings["contrast"],
                 formatter=lambda value: f"{format_number(value)}x",
             )
+            record_href = "/record?action=stop" if recording_state["is_recording"] else "/record?action=start"
+            record_label = "Stop recording" if recording_state["is_recording"] else "Record video"
+            record_class = "button button-danger" if recording_state["is_recording"] else "button button-primary"
+            install_button = ""
+            if not ffmpeg_ready:
+                record_href = "/install-ffmpeg"
+                record_label = "Install ffmpeg"
+                record_class = "button button-secondary"
+                install_button = '<div class="viewer-meta">Recording needs ffmpeg. Press install to fetch it on the Pi.</div>'
+            recording_note = ""
+            if recording_state["is_recording"] and recording_state["started_at"] is not None:
+                started = recording_state["started_at"].strftime("%H:%M:%S")
+                recording_note = f"Recording MP4 started at {started}."
             html = f"""<!doctype html>
 <html>
 <head>
@@ -393,6 +615,14 @@ class Handler(BaseHTTPRequestHandler):
     }}
     .button-primary:hover {{
       background: var(--accent-strong);
+    }}
+    .button-danger {{
+      background: #b91c1c;
+      color: #fff8f8;
+      box-shadow: 0 14px 30px rgba(185, 28, 28, 0.2);
+    }}
+    .button-danger:hover {{
+      background: #991b1b;
     }}
     .button-secondary {{
       border-color: rgba(17, 94, 89, 0.18);
@@ -584,6 +814,51 @@ class Handler(BaseHTTPRequestHandler):
       pointer-events: none;
       background: linear-gradient(to top, rgba(17,24,39,0.24), transparent 36%);
     }}
+    .viewer-shell {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 280px;
+      gap: 18px;
+    }}
+    .viewer-actions {{
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }}
+    .viewer-card {{
+      padding: 18px;
+      border-radius: 20px;
+      background: rgba(255,255,255,0.62);
+      border: 1px solid rgba(31, 36, 33, 0.08);
+    }}
+    .viewer-card h3 {{
+      margin: 0 0 10px;
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+    }}
+    .viewer-card p {{
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 0.93rem;
+      line-height: 1.6;
+    }}
+    .viewer-card .button {{
+      width: 100%;
+    }}
+    .viewer-meta {{
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.55;
+    }}
+    .flash {{
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(185, 28, 28, 0.12);
+      background: rgba(255, 241, 242, 0.9);
+      color: #991b1b;
+      font-weight: 700;
+    }}
     img {{
       display: block;
       width: 100%;
@@ -607,6 +882,9 @@ class Handler(BaseHTTPRequestHandler):
       }}
       .control-grid,
       .current-stack {{
+        grid-template-columns: 1fr;
+      }}
+      .viewer-shell {{
         grid-template-columns: 1fr;
       }}
       .stream-header {{
@@ -658,6 +936,7 @@ class Handler(BaseHTTPRequestHandler):
             <span>White balance mode currently driving the image tone.</span>
           </div>
         </div>
+        {f'<div class="flash">{flash_message}</div>' if flash_message else ""}
       </article>
 
       <aside class="panel hero-side">
@@ -738,8 +1017,25 @@ class Handler(BaseHTTPRequestHandler):
         <h2>Live preview</h2>
         <div class="status">Streaming over HTTP on port {PORT}</div>
       </div>
-      <div class="frame">
-        <img src="/stream.mjpg" alt="Live Raspberry Pi camera preview">
+      <div class="viewer-shell">
+        <div class="frame">
+          <img src="/stream.mjpg" alt="Live Raspberry Pi camera preview">
+        </div>
+        <aside class="viewer-actions">
+          <section class="viewer-card">
+            <h3>Recording</h3>
+            <p>Start saving the live viewer feed to MP4. The same button switches to stop while a recording is in progress.</p>
+            <a class="{record_class}" href="{record_href}">{record_label}</a>
+            <div class="viewer-meta">{recording_note or "Saved files are written into the recordings directory."}</div>
+            {install_button}
+          </section>
+          <section class="viewer-card">
+            <h3>Screenshot</h3>
+            <p>Save the latest available frame as a JPEG without interrupting the stream.</p>
+            <a class="button button-secondary" href="/save-snapshot">Save screenshot</a>
+            <div class="viewer-meta">Screenshots are written into the captures directory.</div>
+          </section>
+        </aside>
       </div>
       <p class="footer-note">
         For embedding in another app or dashboard, use the direct MJPEG endpoint. For single-frame polling, use the snapshot route.
