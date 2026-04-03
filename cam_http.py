@@ -4,18 +4,43 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 HOST = "0.0.0.0"
 PORT = 8000
 
-WIDTH = 640
-HEIGHT = 480
-FRAMERATE = 15
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 480
+DEFAULT_FRAMERATE = 15
 QUALITY = 80
+DEFAULT_AWB = "auto"
+DEFAULT_SATURATION = 1.0
+DEFAULT_CONTRAST = 1.0
+
+RESOLUTION_PRESETS = {
+    "640x480": (640, 480),
+    "1280x720": (1280, 720),
+    "1920x1080": (1920, 1080),
+}
+
+FRAMERATE_PRESETS = [10, 15, 24, 30]
+AWB_PRESETS = ["auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy"]
+SATURATION_PRESETS = [0.7, 1.0, 1.3, 1.6]
+CONTRAST_PRESETS = [0.8, 1.0, 1.2, 1.5]
 
 latest_frame = None
 frame_id = 0
 frame_cond = threading.Condition()
+settings_lock = threading.Lock()
+camera_generation = 0
+camera_settings = {
+    "width": DEFAULT_WIDTH,
+    "height": DEFAULT_HEIGHT,
+    "framerate": DEFAULT_FRAMERATE,
+    "awb": DEFAULT_AWB,
+    "saturation": DEFAULT_SATURATION,
+    "contrast": DEFAULT_CONTRAST,
+}
 
 
 def drain_stderr(pipe, tail):
@@ -28,26 +53,70 @@ def drain_stderr(pipe, tail):
         pipe.close()
 
 
-def camera_worker():
-    global latest_frame, frame_id
+def get_camera_settings():
+    with settings_lock:
+        return dict(camera_settings), camera_generation
 
-    cmd = [
+
+def update_camera_settings(changes):
+    global camera_generation
+    with settings_lock:
+        changed = False
+        for key, value in changes.items():
+            if camera_settings.get(key) != value:
+                camera_settings[key] = value
+                changed = True
+        if changed:
+            camera_generation += 1
+    return changed
+
+
+def build_camera_command(settings):
+    return [
         "rpicam-vid",
         "-t", "0",
         "-n",
         "--codec", "mjpeg",
-        "--width", str(WIDTH),
-        "--height", str(HEIGHT),
-        "--framerate", str(FRAMERATE),
+        "--width", str(settings["width"]),
+        "--height", str(settings["height"]),
+        "--framerate", str(settings["framerate"]),
         "--quality", str(QUALITY),
+        "--awb", settings["awb"],
+        "--saturation", str(settings["saturation"]),
+        "--contrast", str(settings["contrast"]),
         "-o", "-",
     ]
+
+
+def format_number(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return f"{value:.1f}" if isinstance(value, float) else str(value)
+
+
+def render_option_buttons(name, options, current_value, formatter=str):
+    buttons = []
+    for option in options:
+        selected = option == current_value
+        label = formatter(option)
+        class_name = "chip chip-active" if selected else "chip"
+        buttons.append(
+            f'<a class="{class_name}" href="/control?{name}={option}">{label}</a>'
+        )
+    return "".join(buttons)
+
+
+def camera_worker():
+    global latest_frame, frame_id
 
     while True:
         proc = None
         stderr_tail = deque(maxlen=10)
         stderr_thread = None
+        restart_requested = False
         try:
+            settings, generation = get_camera_settings()
+            cmd = build_camera_command(settings)
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -64,6 +133,10 @@ def camera_worker():
             buffer = bytearray()
 
             while True:
+                _, latest_generation = get_camera_settings()
+                if latest_generation != generation:
+                    restart_requested = True
+                    raise RuntimeError("camera settings changed")
                 chunk = proc.stdout.read(4096)
                 if not chunk:
                     err = " | ".join(stderr_tail)
@@ -95,7 +168,10 @@ def camera_worker():
 
         except Exception as e:
             print(f"[camera] {e}", flush=True)
-            time.sleep(1)
+            if restart_requested:
+                restart_requested = False
+            else:
+                time.sleep(1)
         finally:
             if proc is not None:
                 try:
@@ -113,7 +189,88 @@ def camera_worker():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/control":
+            params = parse_qs(parsed.query)
+            changes = {}
+
+            resolution = params.get("resolution", [None])[0]
+            if resolution in RESOLUTION_PRESETS:
+                width, height = RESOLUTION_PRESETS[resolution]
+                changes["width"] = width
+                changes["height"] = height
+
+            framerate = params.get("framerate", [None])[0]
+            if framerate is not None:
+                try:
+                    fps = int(framerate)
+                except ValueError:
+                    fps = None
+                if fps in FRAMERATE_PRESETS:
+                    changes["framerate"] = fps
+
+            awb = params.get("awb", [None])[0]
+            if awb in AWB_PRESETS:
+                changes["awb"] = awb
+
+            saturation = params.get("saturation", [None])[0]
+            if saturation is not None:
+                try:
+                    sat = float(saturation)
+                except ValueError:
+                    sat = None
+                if sat in SATURATION_PRESETS:
+                    changes["saturation"] = sat
+
+            contrast = params.get("contrast", [None])[0]
+            if contrast is not None:
+                try:
+                    con = float(contrast)
+                except ValueError:
+                    con = None
+                if con in CONTRAST_PRESETS:
+                    changes["contrast"] = con
+
+            update_camera_settings(changes)
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
+        if path in ("/", "/index.html"):
+            settings, _ = get_camera_settings()
+            resolution_label = f'{settings["width"]}x{settings["height"]}'
+            resolution_buttons = render_option_buttons(
+                "resolution",
+                list(RESOLUTION_PRESETS.keys()),
+                resolution_label,
+            )
+            framerate_buttons = render_option_buttons(
+                "framerate",
+                FRAMERATE_PRESETS,
+                settings["framerate"],
+                formatter=lambda value: f"{value} FPS",
+            )
+            awb_buttons = render_option_buttons(
+                "awb",
+                AWB_PRESETS,
+                settings["awb"],
+                formatter=lambda value: value.title(),
+            )
+            saturation_buttons = render_option_buttons(
+                "saturation",
+                SATURATION_PRESETS,
+                settings["saturation"],
+                formatter=lambda value: f"{format_number(value)}x",
+            )
+            contrast_buttons = render_option_buttons(
+                "contrast",
+                CONTRAST_PRESETS,
+                settings["contrast"],
+                formatter=lambda value: f"{format_number(value)}x",
+            )
             html = f"""<!doctype html>
 <html>
 <head>
@@ -302,6 +459,86 @@ class Handler(BaseHTTPRequestHandler):
       margin-top: 24px;
       padding: 18px;
     }}
+    .control-panel {{
+      margin-top: 24px;
+      padding: 20px;
+    }}
+    .control-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 10px;
+    }}
+    .control-card {{
+      padding: 18px;
+      border-radius: 20px;
+      background: rgba(255,255,255,0.58);
+      border: 1px solid rgba(31, 36, 33, 0.08);
+    }}
+    .control-card h3 {{
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+    }}
+    .control-card p {{
+      margin: 8px 0 14px;
+      color: var(--muted);
+      font-size: 0.93rem;
+      line-height: 1.55;
+    }}
+    .chip-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }}
+    .chip {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 0 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(17, 94, 89, 0.14);
+      background: rgba(255,255,255,0.78);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.92rem;
+      font-weight: 700;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+    }}
+    .chip:hover {{
+      transform: translateY(-1px);
+      border-color: rgba(17, 94, 89, 0.28);
+    }}
+    .chip-active {{
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      border-color: transparent;
+      color: #f7fffd;
+      box-shadow: 0 12px 24px rgba(15, 118, 110, 0.18);
+    }}
+    .current-stack {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }}
+    .current-pill {{
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.68);
+      border: 1px solid rgba(31, 36, 33, 0.08);
+    }}
+    .current-pill strong {{
+      display: block;
+      font-size: 0.96rem;
+      letter-spacing: -0.02em;
+    }}
+    .current-pill span {{
+      display: block;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }}
     .stream-header {{
       display: flex;
       align-items: center;
@@ -368,6 +605,10 @@ class Handler(BaseHTTPRequestHandler):
       .stats {{
         grid-template-columns: 1fr;
       }}
+      .control-grid,
+      .current-stack {{
+        grid-template-columns: 1fr;
+      }}
       .stream-header {{
         align-items: flex-start;
         flex-direction: column;
@@ -405,16 +646,16 @@ class Handler(BaseHTTPRequestHandler):
         </div>
         <div class="stats">
           <div class="stat">
-            <strong>{WIDTH} x {HEIGHT}</strong>
+            <strong>{resolution_label}</strong>
             <span>Balanced for browser viewing and LAN access.</span>
           </div>
           <div class="stat">
-            <strong>{FRAMERATE} FPS</strong>
+            <strong>{settings["framerate"]} FPS</strong>
             <span>Configured stream cadence for smooth previews.</span>
           </div>
           <div class="stat">
-            <strong>MJPEG output</strong>
-            <span>Simple to consume from browsers, tools, and embeds.</span>
+            <strong>{settings["awb"].title()}</strong>
+            <span>White balance mode currently driving the image tone.</span>
           </div>
         </div>
       </article>
@@ -434,6 +675,62 @@ class Handler(BaseHTTPRequestHandler):
           </p>
         </section>
       </aside>
+    </section>
+
+    <section class="panel control-panel">
+      <div class="stream-header">
+        <h2>Camera controls</h2>
+        <div class="status">Each change restarts capture with the new profile</div>
+      </div>
+      <div class="current-stack">
+        <div class="current-pill">
+          <strong>{resolution_label}</strong>
+          <span>Resolution</span>
+        </div>
+        <div class="current-pill">
+          <strong>{settings["framerate"]} FPS</strong>
+          <span>Framerate</span>
+        </div>
+        <div class="current-pill">
+          <strong>{settings["awb"].title()}</strong>
+          <span>White balance</span>
+        </div>
+        <div class="current-pill">
+          <strong>{format_number(settings["saturation"])}x</strong>
+          <span>Saturation</span>
+        </div>
+        <div class="current-pill">
+          <strong>{format_number(settings["contrast"])}x</strong>
+          <span>Contrast</span>
+        </div>
+      </div>
+      <div class="control-grid">
+        <section class="control-card">
+          <h3>Resolution</h3>
+          <p>Pick a stream size based on detail versus bandwidth and browser smoothness.</p>
+          <div class="chip-row">{resolution_buttons}</div>
+        </section>
+        <section class="control-card">
+          <h3>Framerate</h3>
+          <p>Lower rates cut CPU and network load. Higher rates feel more immediate.</p>
+          <div class="chip-row">{framerate_buttons}</div>
+        </section>
+        <section class="control-card">
+          <h3>White balance</h3>
+          <p>Choose the lighting preset that best matches the room or daylight conditions.</p>
+          <div class="chip-row">{awb_buttons}</div>
+        </section>
+        <section class="control-card">
+          <h3>Saturation</h3>
+          <p>Adjust overall color intensity from flatter neutral tones to more vivid output.</p>
+          <div class="chip-row">{saturation_buttons}</div>
+        </section>
+        <section class="control-card">
+          <h3>Contrast</h3>
+          <p>Control edge separation and punch, especially useful in low-texture scenes.</p>
+          <div class="chip-row">{contrast_buttons}</div>
+        </section>
+      </div>
     </section>
 
     <section class="panel stream-panel">
@@ -459,7 +756,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if self.path == "/snapshot.jpg":
+        if path == "/snapshot.jpg":
             with frame_cond:
                 ok = frame_cond.wait_for(lambda: latest_frame is not None, timeout=10)
                 frame = latest_frame if ok else None
@@ -477,7 +774,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(frame)
             return
 
-        if self.path == "/stream.mjpg":
+        if path == "/stream.mjpg":
             self.send_response(200)
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("Pragma", "no-cache")
