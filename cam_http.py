@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 from collections import deque
-from pathlib import Path
-from datetime import datetime
-import os
-import shutil
+import json
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, urlparse
 
 HOST = "0.0.0.0"
 PORT = 8000
@@ -20,8 +17,6 @@ QUALITY = 80
 DEFAULT_AWB = "auto"
 DEFAULT_SATURATION = 1.0
 DEFAULT_CONTRAST = 1.0
-SNAPSHOT_DIR = Path("captures")
-RECORDING_DIR = Path("recordings")
 
 RESOLUTION_PRESETS = {
     "640x480": (640, 480),
@@ -47,12 +42,6 @@ camera_settings = {
     "saturation": DEFAULT_SATURATION,
     "contrast": DEFAULT_CONTRAST,
 }
-recording_lock = threading.Lock()
-recording_proc = None
-recording_path = None
-recording_started_at = None
-ffmpeg_lock = threading.Lock()
-ffmpeg_install_error = ""
 
 
 def drain_stderr(pipe, tail):
@@ -113,164 +102,9 @@ def render_option_buttons(name, options, current_value, formatter=str):
         label = formatter(option)
         class_name = "chip chip-active" if selected else "chip"
         buttons.append(
-            f'<a class="{class_name}" href="/control?{name}={option}">{label}</a>'
+            f'<a class="{class_name}" data-control="{name}" data-value="{option}" href="/control?{name}={option}">{label}</a>'
         )
     return "".join(buttons)
-
-
-def ffmpeg_available():
-    return shutil.which("ffmpeg") is not None
-
-
-def install_ffmpeg():
-    global ffmpeg_install_error
-
-    with ffmpeg_lock:
-        if ffmpeg_available():
-            ffmpeg_install_error = ""
-            return True, "ffmpeg is already installed."
-
-        prefix = ["sudo"] if os.geteuid() != 0 else []
-        commands = [
-            prefix + ["apt-get", "update"],
-            prefix + ["apt-get", "install", "-y", "ffmpeg"],
-        ]
-
-        try:
-            for cmd in commands:
-                result = subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                if result.stderr.strip():
-                    ffmpeg_install_error = result.stderr.strip()
-            ffmpeg_install_error = ""
-            return True, "ffmpeg installed successfully."
-        except FileNotFoundError as exc:
-            ffmpeg_install_error = "apt-get or sudo is not available on this system."
-            return False, ffmpeg_install_error
-        except subprocess.CalledProcessError as exc:
-            detail = exc.stderr.strip() or exc.stdout.strip() or "ffmpeg installation failed."
-            ffmpeg_install_error = detail
-            return False, detail
-
-
-def ensure_output_dir(path):
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def capture_snapshot():
-    with frame_cond:
-        ok = frame_cond.wait_for(lambda: latest_frame is not None, timeout=10)
-        frame = latest_frame if ok else None
-
-    if frame is None:
-        raise RuntimeError("No frame available yet")
-
-    ensure_output_dir(SNAPSHOT_DIR)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    snapshot_path = SNAPSHOT_DIR / f"snapshot-{timestamp}.jpg"
-    snapshot_path.write_bytes(frame)
-    return snapshot_path
-
-
-def get_recording_state():
-    global recording_proc, recording_path, recording_started_at
-
-    with recording_lock:
-        if recording_proc is not None and recording_proc.poll() is not None:
-            recording_proc = None
-            recording_path = None
-            recording_started_at = None
-
-        return {
-            "is_recording": recording_proc is not None,
-            "path": recording_path,
-            "started_at": recording_started_at,
-        }
-
-
-def start_recording():
-    global recording_proc, recording_path, recording_started_at
-
-    with recording_lock:
-        if recording_proc is not None and recording_proc.poll() is None:
-            return recording_path
-
-        if not ffmpeg_available():
-            raise RuntimeError("ffmpeg is not installed. Use the install button first.")
-
-        ensure_output_dir(RECORDING_DIR)
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = RECORDING_DIR / f"recording-{timestamp}.mp4"
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "mpjpeg",
-            "-i",
-            f"http://127.0.0.1:{PORT}/stream.mjpg",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(target),
-        ]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("ffmpeg is not installed. Use the install button first.") from exc
-
-        time.sleep(0.2)
-        if proc.poll() is not None:
-            err = proc.stderr.read().strip()
-            raise RuntimeError(err or "recording failed to start")
-
-        recording_proc = proc
-        recording_path = target
-        recording_started_at = datetime.now()
-        return target
-
-
-def stop_recording():
-    global recording_proc, recording_path, recording_started_at
-
-    with recording_lock:
-        proc = recording_proc
-        target = recording_path
-
-        if proc is None or proc.poll() is not None:
-            recording_proc = None
-            recording_path = None
-            recording_started_at = None
-            return target
-
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-
-        err = proc.stderr.read().strip() if proc.stderr is not None else ""
-        recording_proc = None
-        recording_path = None
-        recording_started_at = None
-
-        if proc.returncode not in (0, 255):
-            raise RuntimeError(err or "recording failed to stop cleanly")
-
-        return target
 
 
 def camera_worker():
@@ -355,12 +189,21 @@ def camera_worker():
 
 
 class Handler(BaseHTTPRequestHandler):
+    def send_json(self, payload, status=200):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        params = parse_qs(parsed.query)
 
         if path == "/control":
-            params = parse_qs(parsed.query)
             changes = {}
 
             resolution = params.get("resolution", [None])[0]
@@ -401,55 +244,24 @@ class Handler(BaseHTTPRequestHandler):
                     changes["contrast"] = con
 
             update_camera_settings(changes)
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        if path == "/record":
-            params = parse_qs(parsed.query)
-            action = params.get("action", ["toggle"])[0]
-            try:
-                state = get_recording_state()
-                if action == "start" or (action == "toggle" and not state["is_recording"]):
-                    start_recording()
-                else:
-                    stop_recording()
-            except RuntimeError as exc:
+            settings, _ = get_camera_settings()
+            if params.get("ajax", ["0"])[0] == "1":
+                self.send_json(
+                    {
+                        "ok": True,
+                        "settings": settings,
+                        "resolutionLabel": f'{settings["width"]}x{settings["height"]}',
+                    }
+                )
+            else:
                 self.send_response(303)
-                self.send_header("Location", f"/?message={quote_plus(str(exc))}")
+                self.send_header("Location", "/")
                 self.end_headers()
-                return
-
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        if path == "/install-ffmpeg":
-            ok, message = install_ffmpeg()
-            self.send_response(303)
-            self.send_header("Location", f"/?message={quote_plus(message)}")
-            self.end_headers()
-            return
-
-        if path == "/save-snapshot":
-            try:
-                capture_snapshot()
-            except RuntimeError as exc:
-                self.send_error(503, str(exc))
-                return
-
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
             return
 
         if path in ("/", "/index.html"):
             settings, _ = get_camera_settings()
-            recording_state = get_recording_state()
-            flash_message = parse_qs(parsed.query).get("message", [""])[0]
-            ffmpeg_ready = ffmpeg_available()
+            flash_message = params.get("message", [""])[0]
             resolution_label = f'{settings["width"]}x{settings["height"]}'
             resolution_buttons = render_option_buttons(
                 "resolution",
@@ -480,19 +292,6 @@ class Handler(BaseHTTPRequestHandler):
                 settings["contrast"],
                 formatter=lambda value: f"{format_number(value)}x",
             )
-            record_href = "/record?action=stop" if recording_state["is_recording"] else "/record?action=start"
-            record_label = "Stop recording" if recording_state["is_recording"] else "Record video"
-            record_class = "button button-danger" if recording_state["is_recording"] else "button button-primary"
-            install_button = ""
-            if not ffmpeg_ready:
-                record_href = "/install-ffmpeg"
-                record_label = "Install ffmpeg"
-                record_class = "button button-secondary"
-                install_button = '<div class="viewer-meta">Recording needs ffmpeg. Press install to fetch it on the Pi.</div>'
-            recording_note = ""
-            if recording_state["is_recording"] and recording_state["started_at"] is not None:
-                started = recording_state["started_at"].strftime("%H:%M:%S")
-                recording_note = f"Recording MP4 started at {started}."
             html = f"""<!doctype html>
 <html>
 <head>
@@ -746,6 +545,10 @@ class Handler(BaseHTTPRequestHandler):
       color: #f7fffd;
       box-shadow: 0 12px 24px rgba(15, 118, 110, 0.18);
     }}
+    .chip-pending {{
+      opacity: 0.6;
+      pointer-events: none;
+    }}
     .current-stack {{
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -844,11 +647,19 @@ class Handler(BaseHTTPRequestHandler):
     .viewer-card .button {{
       width: 100%;
     }}
+    .button-busy {{
+      opacity: 0.7;
+      pointer-events: none;
+    }}
     .viewer-meta {{
       margin-top: 12px;
       color: var(--muted);
       font-size: 0.88rem;
       line-height: 1.55;
+    }}
+    .record-indicator {{
+      color: #991b1b;
+      font-weight: 700;
     }}
     .flash {{
       margin-top: 18px;
@@ -1024,16 +835,15 @@ class Handler(BaseHTTPRequestHandler):
         <aside class="viewer-actions">
           <section class="viewer-card">
             <h3>Recording</h3>
-            <p>Start saving the live viewer feed to MP4. The same button switches to stop while a recording is in progress.</p>
-            <a class="{record_class}" href="{record_href}">{record_label}</a>
-            <div class="viewer-meta">{recording_note or "Saved files are written into the recordings directory."}</div>
-            {install_button}
+            <p>Record the live preview in your browser and download it on this device without saving anything on the Pi.</p>
+            <button id="recordButton" class="button button-primary" type="button">Record video</button>
+            <div id="recordMeta" class="viewer-meta">The recording downloads on stop. MP4 is preferred when this browser supports it.</div>
           </section>
           <section class="viewer-card">
             <h3>Screenshot</h3>
-            <p>Save the latest available frame as a JPEG without interrupting the stream.</p>
-            <a class="button button-secondary" href="/save-snapshot">Save screenshot</a>
-            <div class="viewer-meta">Screenshots are written into the captures directory.</div>
+            <p>Download the current frame to this device without interrupting the stream or moving the page.</p>
+            <button id="snapshotButton" class="button button-secondary" type="button">Save screenshot</button>
+            <div id="snapshotMeta" class="viewer-meta">Screenshots download directly in the browser as JPEG files.</div>
           </section>
         </aside>
       </div>
@@ -1042,6 +852,241 @@ class Handler(BaseHTTPRequestHandler):
       </p>
     </section>
   </main>
+  <script>
+    (() => {{
+      const streamImage = document.querySelector('img[src="/stream.mjpg"]');
+      const flash = document.querySelector('.flash');
+      const currentCards = {{
+        resolution: document.querySelector('.current-pill:nth-child(1) strong'),
+        framerate: document.querySelector('.current-pill:nth-child(2) strong'),
+        awb: document.querySelector('.current-pill:nth-child(3) strong'),
+        saturation: document.querySelector('.current-pill:nth-child(4) strong'),
+        contrast: document.querySelector('.current-pill:nth-child(5) strong'),
+      }};
+      const settings = {{
+        width: {settings["width"]},
+        height: {settings["height"]},
+        framerate: {settings["framerate"]},
+        awb: {json.dumps(settings["awb"])},
+        saturation: {settings["saturation"]},
+        contrast: {settings["contrast"]},
+      }};
+      const recordButton = document.getElementById('recordButton');
+      const recordMeta = document.getElementById('recordMeta');
+      const snapshotButton = document.getElementById('snapshotButton');
+      const snapshotMeta = document.getElementById('snapshotMeta');
+      const offscreenCanvas = document.createElement('canvas');
+      const offscreenContext = offscreenCanvas.getContext('2d');
+      let recorder = null;
+      let recorderChunks = [];
+      let recordMimeType = '';
+      let recordExtension = 'webm';
+      let drawTimer = null;
+
+      function showFlash(message, isError = false) {{
+        if (!flash) {{
+          return;
+        }}
+        flash.textContent = message;
+        flash.style.display = message ? 'block' : 'none';
+        flash.style.color = isError ? '#991b1b' : '#115e59';
+        flash.style.borderColor = isError ? 'rgba(185, 28, 28, 0.12)' : 'rgba(17, 94, 89, 0.12)';
+        flash.style.background = isError ? 'rgba(255, 241, 242, 0.9)' : 'rgba(240, 253, 250, 0.9)';
+      }}
+
+      function formatNumber(value) {{
+        return Number.isInteger(value) ? String(value) : value.toFixed(1);
+      }}
+
+      function updateCurrentSettings(next) {{
+        settings.width = next.width;
+        settings.height = next.height;
+        settings.framerate = next.framerate;
+        settings.awb = next.awb;
+        settings.saturation = next.saturation;
+        settings.contrast = next.contrast;
+        currentCards.resolution.textContent = `${{next.width}}x${{next.height}}`;
+        currentCards.framerate.textContent = `${{next.framerate}} FPS`;
+        currentCards.awb.textContent = next.awb.charAt(0).toUpperCase() + next.awb.slice(1);
+        currentCards.saturation.textContent = `${{formatNumber(next.saturation)}}x`;
+        currentCards.contrast.textContent = `${{formatNumber(next.contrast)}}x`;
+      }}
+
+      async function applyControl(link) {{
+        const group = link.dataset.control;
+        const value = link.dataset.value;
+        const siblings = document.querySelectorAll(`[data-control="${{group}}"]`);
+        siblings.forEach((item) => item.classList.add('chip-pending'));
+        try {{
+          const response = await fetch(`/control?ajax=1&${{group}}=${{encodeURIComponent(value)}}`, {{
+            headers: {{ 'X-Requested-With': 'fetch' }},
+            cache: 'no-store',
+          }});
+          if (!response.ok) {{
+            throw new Error('Control update failed');
+          }}
+          const payload = await response.json();
+          updateCurrentSettings(payload.settings);
+          siblings.forEach((item) => {{
+            item.classList.remove('chip-active');
+            if (item === link) {{
+              item.classList.add('chip-active');
+            }}
+          }});
+        }} catch (error) {{
+          showFlash(error.message || 'Control update failed.', true);
+        }} finally {{
+          siblings.forEach((item) => item.classList.remove('chip-pending'));
+        }}
+      }}
+
+      document.querySelectorAll('[data-control]').forEach((link) => {{
+        link.addEventListener('click', (event) => {{
+          event.preventDefault();
+          applyControl(link);
+        }});
+      }});
+
+      function filename(prefix, extension) {{
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        return `${{prefix}}-${{stamp}}.${{extension}}`;
+      }}
+
+      async function downloadBlob(blob, name) {{
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = name;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }}
+
+      snapshotButton.addEventListener('click', async () => {{
+        snapshotButton.classList.add('button-busy');
+        snapshotMeta.textContent = 'Capturing JPEG on this device...';
+        try {{
+          const response = await fetch('/snapshot.jpg', {{ cache: 'no-store' }});
+          if (!response.ok) {{
+            throw new Error('Snapshot is not available yet.');
+          }}
+          const blob = await response.blob();
+          await downloadBlob(blob, filename('snapshot', 'jpg'));
+          snapshotMeta.textContent = 'Screenshot downloaded to this device.';
+        }} catch (error) {{
+          snapshotMeta.textContent = error.message || 'Screenshot failed.';
+        }} finally {{
+          snapshotButton.classList.remove('button-busy');
+        }}
+      }});
+
+      function pickRecordingFormat() {{
+        const options = [
+          ['video/mp4;codecs=h264', 'mp4'],
+          ['video/mp4', 'mp4'],
+          ['video/webm;codecs=vp9', 'webm'],
+          ['video/webm;codecs=vp8', 'webm'],
+          ['video/webm', 'webm'],
+        ];
+        for (const [mime, extension] of options) {{
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(mime)) {{
+            return {{ mime, extension }};
+          }}
+        }}
+        return null;
+      }}
+
+      function syncCanvasSize() {{
+        const width = streamImage.naturalWidth || settings.width;
+        const height = streamImage.naturalHeight || settings.height;
+        if (offscreenCanvas.width !== width || offscreenCanvas.height !== height) {{
+          offscreenCanvas.width = width;
+          offscreenCanvas.height = height;
+        }}
+      }}
+
+      function startCanvasPump() {{
+        const interval = Math.max(33, Math.round(1000 / Math.max(settings.framerate, 1)));
+        drawTimer = window.setInterval(() => {{
+          if (!streamImage.complete || offscreenCanvas.width === 0 || offscreenCanvas.height === 0) {{
+            return;
+          }}
+          try {{
+            offscreenContext.drawImage(streamImage, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
+          }} catch (_error) {{
+          }}
+        }}, interval);
+      }}
+
+      async function stopRecording() {{
+        const activeRecorder = recorder;
+        if (!activeRecorder) {{
+          return;
+        }}
+        const blob = await new Promise((resolve, reject) => {{
+          activeRecorder.addEventListener('stop', () => resolve(new Blob(recorderChunks, {{ type: recordMimeType }})), {{ once: true }});
+          activeRecorder.addEventListener('error', () => reject(new Error('Recording failed.')), {{ once: true }});
+          activeRecorder.stop();
+        }});
+        if (drawTimer !== null) {{
+          window.clearInterval(drawTimer);
+          drawTimer = null;
+        }}
+        activeRecorder.stream.getTracks().forEach((track) => track.stop());
+        recorder = null;
+        recorderChunks = [];
+        recordButton.textContent = 'Record video';
+        recordButton.classList.remove('button-danger', 'button-busy');
+        recordButton.classList.add('button-primary');
+        await downloadBlob(blob, filename('recording', recordExtension));
+        recordMeta.innerHTML = `Download complete on this device. <span class="record-indicator">${{recordExtension.toUpperCase()}}</span> saved from the browser.`;
+      }}
+
+      recordButton.addEventListener('click', async () => {{
+        if (recorder) {{
+          recordButton.classList.add('button-busy');
+          recordMeta.textContent = 'Finishing recording and downloading file...';
+          try {{
+            await stopRecording();
+          }} catch (error) {{
+            recordMeta.textContent = error.message || 'Recording failed.';
+          }}
+          return;
+        }}
+
+        const selected = pickRecordingFormat();
+        if (!selected) {{
+          recordMeta.textContent = 'This browser does not support in-browser recording for this stream.';
+          return;
+        }}
+
+        syncCanvasSize();
+        startCanvasPump();
+        const stream = offscreenCanvas.captureStream(settings.framerate);
+        recorderChunks = [];
+        recordMimeType = selected.mime;
+        recordExtension = selected.extension;
+        recorder = new MediaRecorder(stream, {{ mimeType: recordMimeType }});
+        recorder.addEventListener('dataavailable', (event) => {{
+          if (event.data && event.data.size > 0) {{
+            recorderChunks.push(event.data);
+          }}
+        }});
+        recorder.start();
+        recordButton.textContent = 'Stop recording';
+        recordButton.classList.remove('button-primary');
+        recordButton.classList.add('button-danger');
+        recordMeta.innerHTML = `Recording on this device. Output format: <span class="record-indicator">${{recordExtension.toUpperCase()}}</span>.`;
+      }});
+
+      streamImage.addEventListener('load', syncCanvasSize);
+      syncCanvasSize();
+      if (flash && !flash.textContent.trim()) {{
+        flash.style.display = 'none';
+      }}
+    }})();
+  </script>
 </body>
 </html>"""
             body = html.encode("utf-8")
