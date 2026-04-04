@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from collections import deque
 import json
+from pathlib import Path
 import subprocess
 import threading
 import time
@@ -28,6 +29,7 @@ FRAMERATE_PRESETS = [10, 15, 24, 30]
 AWB_PRESETS = ["auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy"]
 SATURATION_PRESETS = [0.7, 1.0, 1.3, 1.6]
 CONTRAST_PRESETS = [0.8, 1.0, 1.2, 1.5]
+CPU_TEMP_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
 
 latest_frame = None
 frame_id = 0
@@ -105,6 +107,14 @@ def render_option_buttons(name, options, current_value, formatter=str):
             f'<a class="{class_name}" data-control="{name}" data-value="{option}" href="/control?{name}={option}">{label}</a>'
         )
     return "".join(buttons)
+
+
+def get_cpu_temperature():
+    try:
+        raw_value = CPU_TEMP_PATH.read_text(encoding="utf-8").strip()
+        return int(raw_value) / 1000.0
+    except (FileNotFoundError, PermissionError, ValueError, OSError):
+        return None
 
 
 def camera_worker():
@@ -259,9 +269,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             return
 
+        if path == "/status":
+            cpu_temp = get_cpu_temperature()
+            self.send_json(
+                {
+                    "ok": True,
+                    "cpuTempC": cpu_temp,
+                    "cpuTempLabel": f"{cpu_temp:.1f} C" if cpu_temp is not None else "Unavailable",
+                }
+            )
+            return
+
         if path in ("/", "/index.html"):
             settings, _ = get_camera_settings()
             flash_message = params.get("message", [""])[0]
+            cpu_temp = get_cpu_temperature()
             resolution_label = f'{settings["width"]}x{settings["height"]}'
             resolution_buttons = render_option_buttons(
                 "resolution",
@@ -603,6 +625,40 @@ class Handler(BaseHTTPRequestHandler):
       background: #34d399;
       box-shadow: 0 0 0 6px rgba(52, 211, 153, 0.16);
     }}
+    .stream-status {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .temp-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.8);
+      border: 1px solid rgba(31, 36, 33, 0.08);
+      color: var(--text);
+      font-size: 0.9rem;
+      font-weight: 700;
+      line-height: 1;
+    }}
+    .temp-badge svg {{
+      width: 14px;
+      height: 14px;
+      color: #b45309;
+      flex: 0 0 auto;
+    }}
+    .temp-badge-hot svg {{
+      color: #b91c1c;
+    }}
+    .temp-badge-warm svg {{
+      color: #d97706;
+    }}
+    .temp-badge-cool svg {{
+      color: #0f766e;
+    }}
     .frame {{
       position: relative;
       overflow: hidden;
@@ -826,7 +882,16 @@ class Handler(BaseHTTPRequestHandler):
     <section class="panel stream-panel">
       <div class="stream-header">
         <h2>Live preview</h2>
-        <div class="status">Streaming over HTTP on port {PORT}</div>
+        <div class="stream-status">
+          <div class="status">Streaming over HTTP on port {PORT}</div>
+          <div id="cpuTempBadge" class="temp-badge" aria-live="polite">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M10 4a2 2 0 1 1 4 0v8.3a4.5 4.5 0 1 1-4 0V4Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M12 14V7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+            <span id="cpuTempLabel">{f"{cpu_temp:.1f} C" if cpu_temp is not None else "Unavailable"}</span>
+          </div>
+        </div>
       </div>
       <div class="viewer-shell">
         <div class="frame">
@@ -875,6 +940,8 @@ class Handler(BaseHTTPRequestHandler):
       const recordMeta = document.getElementById('recordMeta');
       const snapshotButton = document.getElementById('snapshotButton');
       const snapshotMeta = document.getElementById('snapshotMeta');
+      const cpuTempBadge = document.getElementById('cpuTempBadge');
+      const cpuTempLabel = document.getElementById('cpuTempLabel');
       const offscreenCanvas = document.createElement('canvas');
       const offscreenContext = offscreenCanvas.getContext('2d');
       let recorder = null;
@@ -896,6 +963,21 @@ class Handler(BaseHTTPRequestHandler):
 
       function formatNumber(value) {{
         return Number.isInteger(value) ? String(value) : value.toFixed(1);
+      }}
+
+      function updateCpuTemp(label, value) {{
+        cpuTempLabel.textContent = label;
+        cpuTempBadge.classList.remove('temp-badge-hot', 'temp-badge-warm', 'temp-badge-cool');
+        if (typeof value !== 'number') {{
+          return;
+        }}
+        if (value >= 70) {{
+          cpuTempBadge.classList.add('temp-badge-hot');
+        }} else if (value >= 55) {{
+          cpuTempBadge.classList.add('temp-badge-warm');
+        }} else {{
+          cpuTempBadge.classList.add('temp-badge-cool');
+        }}
       }}
 
       function updateCurrentSettings(next) {{
@@ -1082,6 +1164,18 @@ class Handler(BaseHTTPRequestHandler):
 
       streamImage.addEventListener('load', syncCanvasSize);
       syncCanvasSize();
+      updateCpuTemp({json.dumps(f"{cpu_temp:.1f} C" if cpu_temp is not None else "Unavailable")}, {json.dumps(cpu_temp)});
+      window.setInterval(async () => {{
+        try {{
+          const response = await fetch('/status', {{ cache: 'no-store' }});
+          if (!response.ok) {{
+            return;
+          }}
+          const payload = await response.json();
+          updateCpuTemp(payload.cpuTempLabel, payload.cpuTempC);
+        }} catch (_error) {{
+        }}
+      }}, 5000);
       if (flash && !flash.textContent.trim()) {{
         flash.style.display = 'none';
       }}
