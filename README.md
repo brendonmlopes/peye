@@ -41,7 +41,7 @@ Required:
 Optional but useful:
 
 - a modern browser with `MediaRecorder` support for client-side recording
-- `python3-opencv` for server-side face detection fallback when the browser does not support `FaceDetector`
+- `python3-opencv` and `opencv-data` for server-side face detection fallback when the browser does not support `FaceDetector`
 
 ## Install dependencies
 
@@ -63,10 +63,10 @@ Install Raspberry Pi camera apps if `rpicam-vid` is missing:
 sudo apt-get install -y rpicam-apps
 ```
 
-Install OpenCV if you need face detection in browsers that do not support the `FaceDetector` API:
+Install OpenCV and the Haar cascade data files if you need face detection in browsers that do not support the `FaceDetector` API:
 
 ```bash
-sudo apt-get install -y python3-opencv
+sudo apt-get install -y python3-opencv opencv-data
 ```
 
 On some Raspberry Pi OS images, camera support may already be present. You can check with:
@@ -162,7 +162,7 @@ Recording button downloads WebM instead of MP4:
 
 Face recognition cannot detect faces:
 
-- use a browser that exposes the `FaceDetector` API, or install `python3-opencv` for the server-side fallback
+- use a browser that exposes the `FaceDetector` API, or install `python3-opencv opencv-data` for the server-side fallback
 - confirm JavaScript is enabled
 - face profiles are local to the browser where they were registered
 

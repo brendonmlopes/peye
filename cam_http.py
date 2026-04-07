@@ -3,6 +3,7 @@ from collections import deque
 import json
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,12 +38,16 @@ AWB_PRESETS = ["auto", "incandescent", "tungsten", "fluorescent", "indoor", "day
 SATURATION_PRESETS = [0.7, 1.0, 1.3, 1.6]
 CONTRAST_PRESETS = [0.8, 1.0, 1.2, 1.5]
 CPU_TEMP_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
-FACE_CASCADE_FILE = "haarcascade_frontalface_default.xml"
-FACE_CASCADE_PATHS = [
-    Path("/usr/share/opencv4/haarcascades") / FACE_CASCADE_FILE,
-    Path("/usr/share/opencv/haarcascades") / FACE_CASCADE_FILE,
-    Path("/usr/local/share/opencv4/haarcascades") / FACE_CASCADE_FILE,
-    Path("/usr/local/share/opencv/haarcascades") / FACE_CASCADE_FILE,
+FACE_CASCADE_FILES = [
+    "haarcascade_frontalface_default.xml",
+    "haarcascade_frontalface_alt.xml",
+    "haarcascade_frontalface_alt2.xml",
+]
+FACE_CASCADE_DIRS = [
+    Path("/usr/share/opencv4/haarcascades"),
+    Path("/usr/share/opencv/haarcascades"),
+    Path("/usr/local/share/opencv4/haarcascades"),
+    Path("/usr/local/share/opencv/haarcascades"),
 ]
 face_cascade = None
 
@@ -144,19 +149,48 @@ def get_face_cascade():
     if cv2 is None:
         return None
     if face_cascade is None:
-        cascade_paths = []
+        cascade_dirs = []
         cv2_data = getattr(cv2, "data", None)
         haarcascades = getattr(cv2_data, "haarcascades", None)
         if haarcascades:
-            cascade_paths.append(Path(haarcascades) / FACE_CASCADE_FILE)
-        cascade_paths.extend(FACE_CASCADE_PATHS)
+            cascade_dirs.append(Path(haarcascades))
 
-        for cascade_path in cascade_paths:
-            if not cascade_path.exists():
+        cv2_file = getattr(cv2, "__file__", None)
+        if cv2_file:
+            cv2_dir = Path(cv2_file).resolve().parent
+            cascade_dirs.extend([
+                cv2_dir / "data",
+                cv2_dir / "haarcascades",
+                cv2_dir.parent / "cv2" / "data",
+                cv2_dir.parent / "cv2" / "haarcascades",
+            ])
+
+        for entry in sys.path:
+            if not entry:
                 continue
-            candidate = cv2.CascadeClassifier(str(cascade_path))
-            if not candidate.empty():
-                face_cascade = candidate
+            path = Path(entry)
+            cascade_dirs.extend([
+                path / "cv2" / "data",
+                path / "cv2" / "haarcascades",
+            ])
+
+        cascade_dirs.extend(FACE_CASCADE_DIRS)
+
+        seen = set()
+        for cascade_dir in cascade_dirs:
+            cascade_dir = cascade_dir.resolve()
+            if cascade_dir in seen or not cascade_dir.exists():
+                continue
+            seen.add(cascade_dir)
+            for filename in FACE_CASCADE_FILES:
+                cascade_path = cascade_dir / filename
+                if not cascade_path.exists():
+                    continue
+                candidate = cv2.CascadeClassifier(str(cascade_path))
+                if not candidate.empty():
+                    face_cascade = candidate
+                    break
+            if face_cascade is not None:
                 break
     return face_cascade
 
@@ -167,7 +201,7 @@ def detect_faces_server():
 
     cascade = get_face_cascade()
     if cascade is None:
-        return None, "OpenCV face cascade is unavailable."
+        return None, "OpenCV face cascade is unavailable. Install opencv-data or check the haarcascade path."
 
     frame = get_latest_frame()
     if frame is None:
