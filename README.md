@@ -7,6 +7,7 @@ Small Raspberry Pi camera server that exposes:
 - a browser UI for camera controls
 - client-side screenshot download
 - client-side recording download
+- browser-side face recognition mode
 
 The application is implemented in [cam_http.py](/home/mobius/Projects/webcam_rpi/cam_http.py).
 
@@ -26,6 +27,8 @@ The HTTP server exposes:
   Runtime camera setting updates for resolution, framerate, white balance, saturation, and contrast.
 
 The UI uses async browser requests for control changes, so the page updates in place and keeps the current scroll position. Screenshots and recordings are saved on the client side in the browser instead of being written to the Pi filesystem.
+
+Face recognition mode also runs in the browser. It uses the browser `FaceDetector` API when available, draws boxes over detected faces, and stores registered face profiles in that browser's `localStorage`.
 
 ## Dependencies
 
@@ -105,8 +108,12 @@ The dashboard includes:
 - live MJPEG preview
 - screenshot download to the client device
 - recording download to the client device
+- face recognition toggle
+- register-new-person button
 
 Recording is handled in the browser from the live viewer. When supported by the browser, the app prefers MP4 output. If MP4 recording is not supported by the browser’s `MediaRecorder` implementation, it falls back to WebM.
+
+Face recognition mode is browser-side and depends on `FaceDetector` support. Registration stores a lightweight local face profile in the current browser only. It is useful for simple local matching, but it is not a security-grade identity system.
 
 ## Notes about recording
 
@@ -145,6 +152,12 @@ Server starts but browser controls do nothing:
 Recording button downloads WebM instead of MP4:
 
 - that is expected when the browser does not support MP4 recording through `MediaRecorder`
+
+Face recognition button says it is unsupported:
+
+- use a browser that exposes the `FaceDetector` API
+- confirm JavaScript is enabled
+- face profiles are local to the browser where they were registered
 
 ## Files
 

@@ -673,6 +673,14 @@ class Handler(BaseHTTPRequestHandler):
       pointer-events: none;
       background: linear-gradient(to top, rgba(17,24,39,0.24), transparent 36%);
     }}
+    .face-overlay {{
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 2;
+    }}
     .viewer-shell {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) 280px;
@@ -702,6 +710,9 @@ class Handler(BaseHTTPRequestHandler):
     }}
     .viewer-card .button {{
       width: 100%;
+    }}
+    .viewer-card .button + .button {{
+      margin-top: 10px;
     }}
     .button-busy {{
       opacity: 0.7;
@@ -896,8 +907,16 @@ class Handler(BaseHTTPRequestHandler):
       <div class="viewer-shell">
         <div class="frame">
           <img src="/stream.mjpg" alt="Live Raspberry Pi camera preview">
+          <canvas id="faceOverlay" class="face-overlay" aria-hidden="true"></canvas>
         </div>
         <aside class="viewer-actions">
+          <section class="viewer-card">
+            <h3>Face recognition</h3>
+            <p>Turn on browser-side face detection, then register the face currently visible in the viewer.</p>
+            <button id="faceModeButton" class="button button-secondary" type="button">Face mode off</button>
+            <button id="registerFaceButton" class="button button-secondary" type="button">Register new person</button>
+            <div id="faceMeta" class="viewer-meta">Face profiles stay in this browser. Matching is lightweight and local.</div>
+          </section>
           <section class="viewer-card">
             <h3>Recording</h3>
             <p>Record the live preview in your browser and download it on this device without saving anything on the Pi.</p>
@@ -942,13 +961,25 @@ class Handler(BaseHTTPRequestHandler):
       const snapshotMeta = document.getElementById('snapshotMeta');
       const cpuTempBadge = document.getElementById('cpuTempBadge');
       const cpuTempLabel = document.getElementById('cpuTempLabel');
+      const faceOverlay = document.getElementById('faceOverlay');
+      const faceContext = faceOverlay.getContext('2d');
+      const faceModeButton = document.getElementById('faceModeButton');
+      const registerFaceButton = document.getElementById('registerFaceButton');
+      const faceMeta = document.getElementById('faceMeta');
       const offscreenCanvas = document.createElement('canvas');
       const offscreenContext = offscreenCanvas.getContext('2d');
+      const faceFeatureCanvas = document.createElement('canvas');
+      const faceFeatureContext = faceFeatureCanvas.getContext('2d');
       let recorder = null;
       let recorderChunks = [];
       let recordMimeType = '';
       let recordExtension = 'webm';
       let drawTimer = null;
+      let faceMode = false;
+      let faceTimer = null;
+      let lastFaces = [];
+      let faceDetector = null;
+      const faceStoreKey = 'peye.faceProfiles.v1';
 
       function showFlash(message, isError = false) {{
         if (!flash) {{
@@ -993,6 +1024,217 @@ class Handler(BaseHTTPRequestHandler):
         currentCards.saturation.textContent = `${{formatNumber(next.saturation)}}x`;
         currentCards.contrast.textContent = `${{formatNumber(next.contrast)}}x`;
       }}
+
+      function loadFaceProfiles() {{
+        try {{
+          return JSON.parse(localStorage.getItem(faceStoreKey) || '[]');
+        }} catch (_error) {{
+          return [];
+        }}
+      }}
+
+      function saveFaceProfiles(profiles) {{
+        localStorage.setItem(faceStoreKey, JSON.stringify(profiles));
+      }}
+
+      function ensureFaceDetector() {{
+        if (!('FaceDetector' in window)) {{
+          faceMeta.textContent = 'This browser does not support the FaceDetector API.';
+          return null;
+        }}
+        if (!faceDetector) {{
+          faceDetector = new FaceDetector({{ fastMode: true, maxDetectedFaces: 8 }});
+        }}
+        return faceDetector;
+      }}
+
+      function captureCurrentFrame() {{
+        syncCanvasSize();
+        if (!streamImage.complete || offscreenCanvas.width === 0 || offscreenCanvas.height === 0) {{
+          return false;
+        }}
+        try {{
+          offscreenContext.drawImage(streamImage, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
+          return true;
+        }} catch (_error) {{
+          return false;
+        }}
+      }}
+
+      function syncFaceOverlaySize() {{
+        const bounds = streamImage.getBoundingClientRect();
+        const width = Math.max(1, Math.round(bounds.width));
+        const height = Math.max(1, Math.round(bounds.height));
+        if (faceOverlay.width !== width || faceOverlay.height !== height) {{
+          faceOverlay.width = width;
+          faceOverlay.height = height;
+        }}
+      }}
+
+      function featureForFace(face) {{
+        const box = face.boundingBox;
+        const x = Math.max(0, Math.floor(box.x));
+        const y = Math.max(0, Math.floor(box.y));
+        const width = Math.max(1, Math.min(offscreenCanvas.width - x, Math.floor(box.width)));
+        const height = Math.max(1, Math.min(offscreenCanvas.height - y, Math.floor(box.height)));
+        faceFeatureCanvas.width = 16;
+        faceFeatureCanvas.height = 16;
+        faceFeatureContext.drawImage(offscreenCanvas, x, y, width, height, 0, 0, 16, 16);
+        const pixels = faceFeatureContext.getImageData(0, 0, 16, 16).data;
+        const feature = [];
+        for (let index = 0; index < pixels.length; index += 4) {{
+          const gray = (pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114) / 255;
+          feature.push(Number(gray.toFixed(3)));
+        }}
+        return feature;
+      }}
+
+      function compareFeatures(left, right) {{
+        if (!left || !right || left.length !== right.length) {{
+          return Number.POSITIVE_INFINITY;
+        }}
+        let total = 0;
+        for (let index = 0; index < left.length; index += 1) {{
+          const diff = left[index] - right[index];
+          total += diff * diff;
+        }}
+        return Math.sqrt(total / left.length);
+      }}
+
+      function recognizeFace(face) {{
+        const profiles = loadFaceProfiles();
+        if (profiles.length === 0) {{
+          return 'Unknown';
+        }}
+        const feature = featureForFace(face);
+        let best = {{ name: 'Unknown', distance: Number.POSITIVE_INFINITY }};
+        for (const profile of profiles) {{
+          const distance = compareFeatures(feature, profile.feature);
+          if (distance < best.distance) {{
+            best = {{ name: profile.name, distance }};
+          }}
+        }}
+        return best.distance < 0.18 ? best.name : 'Unknown';
+      }}
+
+      function drawFaceBoxes(faces) {{
+        syncFaceOverlaySize();
+        faceContext.clearRect(0, 0, faceOverlay.width, faceOverlay.height);
+        if (!faceMode) {{
+          return;
+        }}
+        const scaleX = faceOverlay.width / offscreenCanvas.width;
+        const scaleY = faceOverlay.height / offscreenCanvas.height;
+        faceContext.lineWidth = 3;
+        faceContext.font = '700 14px "Avenir Next", "Segoe UI", sans-serif';
+        for (const face of faces) {{
+          const box = face.boundingBox;
+          const x = box.x * scaleX;
+          const y = box.y * scaleY;
+          const width = box.width * scaleX;
+          const height = box.height * scaleY;
+          const label = recognizeFace(face);
+          faceContext.strokeStyle = label === 'Unknown' ? '#facc15' : '#34d399';
+          faceContext.fillStyle = 'rgba(17, 24, 39, 0.76)';
+          faceContext.strokeRect(x, y, width, height);
+          const labelWidth = faceContext.measureText(label).width + 18;
+          faceContext.fillRect(x, Math.max(0, y - 28), labelWidth, 24);
+          faceContext.fillStyle = '#f8fafc';
+          faceContext.fillText(label, x + 9, Math.max(17, y - 10));
+        }}
+      }}
+
+      async function detectFaces() {{
+        if (!faceMode) {{
+          return;
+        }}
+        const detector = ensureFaceDetector();
+        if (!detector || !captureCurrentFrame()) {{
+          faceTimer = window.setTimeout(detectFaces, 800);
+          return;
+        }}
+        try {{
+          const faces = await detector.detect(offscreenCanvas);
+          lastFaces = faces;
+          drawFaceBoxes(faces);
+          faceMeta.textContent = faces.length === 1 ? '1 face detected.' : `${{faces.length}} faces detected.`;
+        }} catch (_error) {{
+          faceMeta.textContent = 'Face detection failed in this browser.';
+          faceMode = false;
+        }} finally {{
+          if (faceMode) {{
+            faceTimer = window.setTimeout(detectFaces, 650);
+          }}
+        }}
+      }}
+
+      function stopFaceMode() {{
+        faceMode = false;
+        faceModeButton.textContent = 'Face mode off';
+        faceModeButton.classList.remove('button-danger');
+        faceModeButton.classList.add('button-secondary');
+        if (faceTimer !== null) {{
+          window.clearTimeout(faceTimer);
+          faceTimer = null;
+        }}
+        lastFaces = [];
+        faceContext.clearRect(0, 0, faceOverlay.width, faceOverlay.height);
+      }}
+
+      faceModeButton.addEventListener('click', () => {{
+        if (faceMode) {{
+          stopFaceMode();
+          faceMeta.textContent = 'Face recognition mode is off.';
+          return;
+        }}
+        if (!ensureFaceDetector()) {{
+          return;
+        }}
+        faceMode = true;
+        faceModeButton.textContent = 'Face mode on';
+        faceModeButton.classList.remove('button-secondary');
+        faceModeButton.classList.add('button-danger');
+        faceMeta.textContent = 'Scanning for faces...';
+        detectFaces();
+      }});
+
+      registerFaceButton.addEventListener('click', async () => {{
+        if (!ensureFaceDetector() || !captureCurrentFrame()) {{
+          faceMeta.textContent = 'No camera frame is ready for registration yet.';
+          return;
+        }}
+        let faces = lastFaces;
+        if (!faceMode || faces.length === 0) {{
+          try {{
+            faces = await faceDetector.detect(offscreenCanvas);
+          }} catch (_error) {{
+            faceMeta.textContent = 'Could not detect a face to register.';
+            return;
+          }}
+        }}
+        if (faces.length === 0) {{
+          faceMeta.textContent = 'No face found. Move closer to the camera and try again.';
+          return;
+        }}
+        const personName = window.prompt('Name for this person?');
+        if (!personName || !personName.trim()) {{
+          return;
+        }}
+        const largestFace = [...faces].sort((left, right) => (
+          right.boundingBox.width * right.boundingBox.height - left.boundingBox.width * left.boundingBox.height
+        ))[0];
+        const profiles = loadFaceProfiles().filter((profile) => profile.name !== personName.trim());
+        profiles.push({{
+          name: personName.trim(),
+          feature: featureForFace(largestFace),
+          registeredAt: new Date().toISOString(),
+        }});
+        saveFaceProfiles(profiles);
+        faceMeta.textContent = `Registered ${{personName.trim()}} in this browser.`;
+        if (faceMode) {{
+          drawFaceBoxes(faces);
+        }}
+      }});
 
       async function applyControl(link) {{
         const group = link.dataset.control;
