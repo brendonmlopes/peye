@@ -37,6 +37,13 @@ AWB_PRESETS = ["auto", "incandescent", "tungsten", "fluorescent", "indoor", "day
 SATURATION_PRESETS = [0.7, 1.0, 1.3, 1.6]
 CONTRAST_PRESETS = [0.8, 1.0, 1.2, 1.5]
 CPU_TEMP_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
+FACE_CASCADE_FILE = "haarcascade_frontalface_default.xml"
+FACE_CASCADE_PATHS = [
+    Path("/usr/share/opencv4/haarcascades") / FACE_CASCADE_FILE,
+    Path("/usr/share/opencv/haarcascades") / FACE_CASCADE_FILE,
+    Path("/usr/local/share/opencv4/haarcascades") / FACE_CASCADE_FILE,
+    Path("/usr/local/share/opencv/haarcascades") / FACE_CASCADE_FILE,
+]
 face_cascade = None
 
 latest_frame = None
@@ -137,10 +144,20 @@ def get_face_cascade():
     if cv2 is None:
         return None
     if face_cascade is None:
-        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-        face_cascade = cv2.CascadeClassifier(str(cascade_path))
-        if face_cascade.empty():
-            face_cascade = None
+        cascade_paths = []
+        cv2_data = getattr(cv2, "data", None)
+        haarcascades = getattr(cv2_data, "haarcascades", None)
+        if haarcascades:
+            cascade_paths.append(Path(haarcascades) / FACE_CASCADE_FILE)
+        cascade_paths.extend(FACE_CASCADE_PATHS)
+
+        for cascade_path in cascade_paths:
+            if not cascade_path.exists():
+                continue
+            candidate = cv2.CascadeClassifier(str(cascade_path))
+            if not candidate.empty():
+                face_cascade = candidate
+                break
     return face_cascade
 
 
