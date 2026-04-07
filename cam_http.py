@@ -8,6 +8,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
+
 HOST = "0.0.0.0"
 PORT = 8000
 
@@ -30,6 +37,7 @@ AWB_PRESETS = ["auto", "incandescent", "tungsten", "fluorescent", "indoor", "day
 SATURATION_PRESETS = [0.7, 1.0, 1.3, 1.6]
 CONTRAST_PRESETS = [0.8, 1.0, 1.2, 1.5]
 CPU_TEMP_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
+face_cascade = None
 
 latest_frame = None
 frame_id = 0
@@ -115,6 +123,62 @@ def get_cpu_temperature():
         return int(raw_value) / 1000.0
     except (FileNotFoundError, PermissionError, ValueError, OSError):
         return None
+
+
+def get_latest_frame(timeout=2):
+    with frame_cond:
+        ok = frame_cond.wait_for(lambda: latest_frame is not None, timeout=timeout)
+        return latest_frame if ok else None
+
+
+def get_face_cascade():
+    global face_cascade
+
+    if cv2 is None:
+        return None
+    if face_cascade is None:
+        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        face_cascade = cv2.CascadeClassifier(str(cascade_path))
+        if face_cascade.empty():
+            face_cascade = None
+    return face_cascade
+
+
+def detect_faces_server():
+    if cv2 is None or np is None:
+        return None, "Install python3-opencv to enable server-side face detection."
+
+    cascade = get_face_cascade()
+    if cascade is None:
+        return None, "OpenCV face cascade is unavailable."
+
+    frame = get_latest_frame()
+    if frame is None:
+        return None, "No camera frame available yet."
+
+    image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return None, "Could not decode the latest camera frame."
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(40, 40),
+    )
+    boxes = [
+        {
+            "boundingBox": {
+                "x": int(x),
+                "y": int(y),
+                "width": int(width),
+                "height": int(height),
+            }
+        }
+        for x, y, width, height in faces
+    ]
+    return boxes, None
 
 
 def camera_worker():
@@ -277,6 +341,19 @@ class Handler(BaseHTTPRequestHandler):
                     "cpuTempC": cpu_temp,
                     "cpuTempLabel": f"{cpu_temp:.1f} C" if cpu_temp is not None else "Unavailable",
                 }
+            )
+            return
+
+        if path == "/faces":
+            faces, error = detect_faces_server()
+            self.send_json(
+                {
+                    "ok": error is None,
+                    "faces": faces or [],
+                    "error": error,
+                    "source": "opencv",
+                },
+                status=200 if error is None else 503,
             )
             return
 
@@ -979,6 +1056,7 @@ class Handler(BaseHTTPRequestHandler):
       let faceTimer = null;
       let lastFaces = [];
       let faceDetector = null;
+      let faceDetectorMode = null;
       const faceStoreKey = 'peye.faceProfiles.v1';
 
       function showFlash(message, isError = false) {{
@@ -1038,14 +1116,15 @@ class Handler(BaseHTTPRequestHandler):
       }}
 
       function ensureFaceDetector() {{
-        if (!('FaceDetector' in window)) {{
-          faceMeta.textContent = 'This browser does not support the FaceDetector API.';
-          return null;
+        if ('FaceDetector' in window) {{
+          if (!faceDetector) {{
+            faceDetector = new FaceDetector({{ fastMode: true, maxDetectedFaces: 8 }});
+          }}
+          faceDetectorMode = 'browser';
+          return true;
         }}
-        if (!faceDetector) {{
-          faceDetector = new FaceDetector({{ fastMode: true, maxDetectedFaces: 8 }});
-        }}
-        return faceDetector;
+        faceDetectorMode = 'server';
+        return true;
       }}
 
       function captureCurrentFrame() {{
@@ -1101,6 +1180,22 @@ class Handler(BaseHTTPRequestHandler):
         return Math.sqrt(total / left.length);
       }}
 
+      async function detectFacesFromFrame() {{
+        if (!ensureFaceDetector() || !captureCurrentFrame()) {{
+          return [];
+        }}
+        if (faceDetectorMode === 'browser') {{
+          return faceDetector.detect(offscreenCanvas);
+        }}
+
+        const response = await fetch('/faces', {{ cache: 'no-store' }});
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {{
+          throw new Error(payload.error || 'Server-side face detection failed.');
+        }}
+        return payload.faces;
+      }}
+
       function recognizeFace(face) {{
         const profiles = loadFaceProfiles();
         if (profiles.length === 0) {{
@@ -1148,19 +1243,21 @@ class Handler(BaseHTTPRequestHandler):
         if (!faceMode) {{
           return;
         }}
-        const detector = ensureFaceDetector();
-        if (!detector || !captureCurrentFrame()) {{
+        if (!ensureFaceDetector() || !captureCurrentFrame()) {{
           faceTimer = window.setTimeout(detectFaces, 800);
           return;
         }}
         try {{
-          const faces = await detector.detect(offscreenCanvas);
+          const faces = await detectFacesFromFrame();
           lastFaces = faces;
           drawFaceBoxes(faces);
-          faceMeta.textContent = faces.length === 1 ? '1 face detected.' : `${{faces.length}} faces detected.`;
-        }} catch (_error) {{
-          faceMeta.textContent = 'Face detection failed in this browser.';
-          faceMode = false;
+          const source = faceDetectorMode === 'browser' ? 'browser' : 'server';
+          faceMeta.textContent = faces.length === 1
+            ? `1 face detected via ${{source}}.`
+            : `${{faces.length}} faces detected via ${{source}}.`;
+        }} catch (error) {{
+          stopFaceMode();
+          faceMeta.textContent = error.message || 'Face detection failed.';
         }} finally {{
           if (faceMode) {{
             faceTimer = window.setTimeout(detectFaces, 650);
@@ -1206,9 +1303,9 @@ class Handler(BaseHTTPRequestHandler):
         let faces = lastFaces;
         if (!faceMode || faces.length === 0) {{
           try {{
-            faces = await faceDetector.detect(offscreenCanvas);
-          }} catch (_error) {{
-            faceMeta.textContent = 'Could not detect a face to register.';
+            faces = await detectFacesFromFrame();
+          }} catch (error) {{
+            faceMeta.textContent = error.message || 'Could not detect a face to register.';
             return;
           }}
         }}
@@ -1434,9 +1531,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/snapshot.jpg":
-            with frame_cond:
-                ok = frame_cond.wait_for(lambda: latest_frame is not None, timeout=10)
-                frame = latest_frame if ok else None
+            frame = get_latest_frame(timeout=10)
 
             if frame is None:
                 self.send_error(503, "No frame available yet")

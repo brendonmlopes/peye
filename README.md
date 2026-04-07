@@ -28,7 +28,7 @@ The HTTP server exposes:
 
 The UI uses async browser requests for control changes, so the page updates in place and keeps the current scroll position. Screenshots and recordings are saved on the client side in the browser instead of being written to the Pi filesystem.
 
-Face recognition mode also runs in the browser. It uses the browser `FaceDetector` API when available, draws boxes over detected faces, and stores registered face profiles in that browser's `localStorage`.
+Face recognition mode prefers the browser `FaceDetector` API when available. If the browser does not support it, the server falls back to OpenCV face detection when `python3-opencv` is installed. Registered face profiles are stored in that browser's `localStorage`.
 
 ## Dependencies
 
@@ -41,6 +41,7 @@ Required:
 Optional but useful:
 
 - a modern browser with `MediaRecorder` support for client-side recording
+- `python3-opencv` for server-side face detection fallback when the browser does not support `FaceDetector`
 
 ## Install dependencies
 
@@ -60,6 +61,12 @@ Install Raspberry Pi camera apps if `rpicam-vid` is missing:
 
 ```bash
 sudo apt-get install -y rpicam-apps
+```
+
+Install OpenCV if you need face detection in browsers that do not support the `FaceDetector` API:
+
+```bash
+sudo apt-get install -y python3-opencv
 ```
 
 On some Raspberry Pi OS images, camera support may already be present. You can check with:
@@ -113,7 +120,7 @@ The dashboard includes:
 
 Recording is handled in the browser from the live viewer. When supported by the browser, the app prefers MP4 output. If MP4 recording is not supported by the browser’s `MediaRecorder` implementation, it falls back to WebM.
 
-Face recognition mode is browser-side and depends on `FaceDetector` support. Registration stores a lightweight local face profile in the current browser only. It is useful for simple local matching, but it is not a security-grade identity system.
+Face recognition mode uses browser-side detection when possible and server-side OpenCV detection as a fallback. Registration stores a lightweight local face profile in the current browser only. It is useful for simple local matching, but it is not a security-grade identity system.
 
 ## Notes about recording
 
@@ -153,9 +160,9 @@ Recording button downloads WebM instead of MP4:
 
 - that is expected when the browser does not support MP4 recording through `MediaRecorder`
 
-Face recognition button says it is unsupported:
+Face recognition cannot detect faces:
 
-- use a browser that exposes the `FaceDetector` API
+- use a browser that exposes the `FaceDetector` API, or install `python3-opencv` for the server-side fallback
 - confirm JavaScript is enabled
 - face profiles are local to the browser where they were registered
 
